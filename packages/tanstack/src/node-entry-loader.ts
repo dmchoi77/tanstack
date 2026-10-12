@@ -1,4 +1,11 @@
 import type { ModuleFederation, ModuleFederationRuntimePlugin } from "@module-federation/runtime";
+import {
+  DEFAULT_REMOTE_FETCH_TIMEOUT_MS,
+  fetchRemoteText,
+  type RemoteFetchOptions,
+} from "./remote-fetch";
+
+export type { RemoteFetchOptions } from "./remote-fetch";
 
 type LoadEntryArgs = Parameters<NonNullable<ModuleFederationRuntimePlugin["loadEntry"]>>[0];
 type RemoteEntryExports = NonNullable<LoadEntryArgs["remoteEntryExports"]>;
@@ -6,15 +13,11 @@ type RemoteInfo = LoadEntryArgs["remoteInfo"];
 type FederationHost = LoadEntryArgs["origin"];
 type NodeModule = typeof import("node:module");
 
-export interface NodeEntryLoaderOptions {
+export interface NodeEntryLoaderOptions extends RemoteFetchOptions {
   /** Re-check manifest/server entries after this many milliseconds. Omit to cache until exit. */
   maxAgeMs?: number;
   /** Revalidation strategy used by the Vite SSR entry loader. */
   strategy?: "temp-file" | "vm";
-  /** Maximum time for a server-entry request. Defaults to 10 seconds; 0 disables the timeout. */
-  fetchTimeoutMs?: number;
-  /** Maximum server-entry response size for Vite remotes; 0 disables the limit. */
-  fetchMaxBytes?: number;
 }
 
 /** A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the original error. */
@@ -59,7 +62,7 @@ export default function nodeEntryLoaderPlugin(
       const { remoteInfo } = args;
       if (!isNodeServer() || !/^https?:\/\//.test(remoteInfo.entry)) return undefined;
       if (remoteInfo.type === "commonjs-module") {
-        return loadCommonJsEntry(remoteInfo, options.fetchTimeoutMs);
+        return loadCommonJsEntry(remoteInfo, options);
       }
       if (remoteInfo.type === "module" || remoteInfo.type === "esm") {
         return loadModuleEntry(args, options);
@@ -70,7 +73,7 @@ export default function nodeEntryLoaderPlugin(
 }
 
 // Matches @module-federation/vite's SSR fetch timeout.
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = DEFAULT_REMOTE_FETCH_TIMEOUT_MS;
 
 function requestOptions(fetchTimeoutMs: number | undefined) {
   const timeout = fetchTimeoutMs ?? FETCH_TIMEOUT_MS;
@@ -97,13 +100,11 @@ function appRequires() {
 
 async function loadCommonJsEntry(
   { entry, entryGlobalName, name }: RemoteInfo,
-  fetchTimeoutMs = FETCH_TIMEOUT_MS,
+  options: RemoteFetchOptions,
 ) {
   let source: string;
   try {
-    const response = await fetch(entry, requestOptions(fetchTimeoutMs));
-    if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
-    source = await response.text();
+    source = await fetchRemoteText(entry, options);
   } catch (cause) {
     throw new RemoteEntryError(
       `Could not fetch the server entry of remote "${name}" from ${entry}.`,
