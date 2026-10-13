@@ -338,6 +338,7 @@ test("resolves a transitive Router core package from the Router package root", (
     const routerRequire = createRequire(join(root, "apps", "rsbuild-ssr-host", "package.json"));
     const routerEntry = routerRequire.resolve("@tanstack/react-router");
     const routerPackage = resolve(dirname(routerEntry), "../..");
+    const routerPackageRequire = createRequire(join(routerPackage, "package.json"));
     const routerLink = join(app, "node_modules", "@tanstack", "react-router");
     mkdirSync(dirname(routerLink), { recursive: true });
     symlinkSync(routerPackage, routerLink, "dir");
@@ -361,8 +362,8 @@ test("resolves a transitive Router core package from the Router package root", (
     const result = spawnSync(process.execPath, [script], { cwd: app, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), {
-      router: "1.170.41",
-      routerCore: "1.171.34",
+      router: routerRequire("@tanstack/react-router/package.json").version,
+      routerCore: routerPackageRequire("@tanstack/router-core/package.json").version,
     });
   } finally {
     rmSync(app, { force: true, recursive: true });
