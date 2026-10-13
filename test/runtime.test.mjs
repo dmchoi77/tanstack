@@ -238,6 +238,58 @@ test("allows disabling the CommonJS entry timeout", async () => {
   assert.equal(typeof container.get, "function");
 });
 
+test("bounds CommonJS server-entry responses", async () => {
+  const entry = serve(
+    "/limits/remoteEntry.ssr.cjs",
+    `module.exports.remote = { init() {}, get() {} };`,
+  );
+
+  await assert.rejects(
+    nodeEntryLoader({ fetchMaxBytes: 16 }).loadEntry({
+      origin: {},
+      remoteInfo: {
+        entry,
+        entryGlobalName: "remote",
+        name: "limited_remote",
+        type: "commonjs-module",
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof RemoteEntryError);
+      assert.equal(error.phase, "fetch");
+      assert.match(error.cause.message, /exceeds the maximum size of 16 bytes/);
+      return true;
+    },
+  );
+});
+
+test("times out CommonJS server-entry responses", async () => {
+  const entry = serve(
+    "/limits/slow-remoteEntry.ssr.cjs",
+    `module.exports.remote = { init() {}, get() {} };`,
+    "text/javascript",
+    50,
+  );
+
+  await assert.rejects(
+    nodeEntryLoader({ fetchTimeoutMs: 5 }).loadEntry({
+      origin: {},
+      remoteInfo: {
+        entry,
+        entryGlobalName: "remote",
+        name: "slow_remote",
+        type: "commonjs-module",
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof RemoteEntryError);
+      assert.equal(error.phase, "fetch");
+      assert.equal(error.cause.name, "AbortError");
+      return true;
+    },
+  );
+});
+
 test("revalidates a Vite SSR entry after maxAgeMs expires", async () => {
   let requestsForViteEntry = 0;
   const entry = serve("/revalidate-vite/remoteEntry.ssr.js", () => {
@@ -488,6 +540,62 @@ test("getRemoteStylesheets reuses manifests briefly and retries failures", async
 
   assert.deepEqual(await getRemoteStylesheets(url, "./Card", { maxAgeMs: 0 }), []);
   assert.equal(fetches(), 3, "an expired manifest is fetched again");
+});
+
+test("getRemoteStylesheets applies fetch limits and parses JSON through the shared policy", async () => {
+  const oversized = serve(
+    "/styles/oversized-mf-manifest.json",
+    JSON.stringify({ exposes: [] }),
+    "application/json",
+  );
+  await assert.rejects(
+    getRemoteStylesheets(oversized, "./Card", { fetchMaxBytes: 8 }),
+    /exceeds the maximum size of 8 bytes/,
+  );
+
+  const malformed = serve("/styles/malformed-mf-manifest.json", "not-json", "application/json");
+  await assert.rejects(
+    getRemoteStylesheets(malformed, "./Card"),
+    /Could not parse the JSON response/,
+  );
+
+  const slow = serve(
+    "/styles/slow-mf-manifest.json",
+    JSON.stringify({ exposes: [] }),
+    "application/json",
+    50,
+  );
+  await assert.rejects(getRemoteStylesheets(slow, "./Card", { fetchTimeoutMs: 5 }), {
+    name: "AbortError",
+  });
+});
+
+test("getRemoteStylesheets single-flights in-flight manifests and timestamps successful cache entries", async () => {
+  let version = "v1";
+  const path = "/styles/concurrent-mf-manifest.json";
+  const url = serve(
+    path,
+    () =>
+      JSON.stringify({
+        exposes: [{ name: "Card", path: "./Card" }],
+        metaData: { publicPath: "auto" },
+        version,
+      }),
+    "application/json",
+    20,
+  );
+
+  const [first, second] = await Promise.all([
+    getRemoteStylesheets(url, "./Card"),
+    getRemoteStylesheets(url, "./Card"),
+  ]);
+  assert.deepEqual(first, []);
+  assert.deepEqual(second, []);
+  assert.equal(requests.filter((request) => request === path).length, 1);
+
+  version = "v2";
+  await getRemoteStylesheets(url, "./Card", { maxAgeMs: 0 });
+  assert.equal(requests.filter((request) => request === path).length, 2);
 });
 
 /** Server-renders `element` to HTML once every Suspense boundary has settled. */
