@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,6 +11,7 @@ const viteRemoteDist = join(root, "apps", "vite-remote", "dist");
 const rsbuildHostDist = join(root, "apps", "rsbuild-host", "dist");
 const rsbuildRemoteDist = join(root, "apps", "rsbuild-remote", "dist");
 const rsbuildSsrHostDist = join(root, "apps", "rsbuild-ssr-host", "dist");
+const remoteRequire = createRequire(join(root, "apps", "vite-remote", "package.json"));
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -52,8 +54,8 @@ test("remote publishes browser and server federation entries", () => {
     assert.equal(shared?.singleton, true, `${dependency} is a singleton`);
   }
   for (const [dependency, version] of [
-    ["@tanstack/react-router", "1.170.41"],
-    ["@tanstack/router-core", "1.171.34"],
+    ["@tanstack/react-router", remoteRequire("@tanstack/react-router/package.json").version],
+    ["@tanstack/router-core", remoteRequire("@tanstack/router-core/package.json").version],
   ]) {
     const shared = manifest.shared.find(({ name }) => name === dependency);
     assert.equal(shared?.singleton, true, `${dependency} is a singleton`);
