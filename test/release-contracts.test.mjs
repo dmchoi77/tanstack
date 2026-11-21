@@ -687,7 +687,7 @@ test("CI uses Node versions supported by the package build toolchain", () => {
   const supportedNode = "^22.18.0 || ^24.11.0 || >=26.0.0";
   assert.equal(rootPackageJson.engines.node, supportedNode);
   assert.equal(packageJson.engines.node, supportedNode);
-  assert.match(ciWorkflow, /node: \["24", "26"\]/);
+  assert.match(ciWorkflow, /node: \["22\.18\.0", "24", "26"\]/);
   assert.doesNotMatch(ciWorkflow, /22\.12\.0/);
 });
 
