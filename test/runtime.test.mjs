@@ -285,7 +285,12 @@ test("times out CommonJS server-entry responses", async () => {
     (error) => {
       assert.ok(error instanceof RemoteEntryError);
       assert.equal(error.phase, "fetch");
-      assert.equal(error.cause.name, "AbortError");
+      assert.equal(error.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
+      assert.equal(error.retryable, true);
+      // The fetch error stays whole, with the abort beneath it.
+      assert.equal(error.cause.name, "RemoteFetchError");
+      assert.equal(error.cause.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
+      assert.equal(error.cause.cause.name, "AbortError");
       return true;
     },
   );
@@ -494,6 +499,31 @@ test("Vite remotes report a reachable remote without a server entry", async () =
   assert.match(outcome.message, /could not load the server entry of remote "vite_remote"/);
 });
 
+test("Vite remotes classify fetch failures by what the remote answered", async () => {
+  const outcome = await runInHost(`
+    const origin = { name: "host", options: { shared: {} }, shareScopeMap: {} };
+    const load = (entry) =>
+      loader()
+        .loadEntry({ origin, remoteInfo: { entry, name: "vite_remote", type: "module" } })
+        .catch(({ code, phase, retryable }) => ({ code, phase, retryable }));
+    console.log(JSON.stringify({
+      // A closed port: the remote is down.
+      down: await load("http://127.0.0.1:9/remoteEntry.js"),
+      missing: await load(${JSON.stringify(`${origin}/vite-missing/remoteEntry.js`)}),
+    }));
+  `);
+  assert.deepEqual(outcome.down, {
+    code: "TANSTACK-REMOTE-FETCH-NETWORK",
+    phase: "fetch",
+    retryable: true,
+  });
+  assert.deepEqual(outcome.missing, {
+    code: "TANSTACK-REMOTE-FETCH-HTTP",
+    phase: "fetch",
+    retryable: false,
+  });
+});
+
 test("getRemoteStylesheets resolves an expose's CSS from its manifest", async () => {
   const manifest = (publicPath) =>
     JSON.stringify({
@@ -568,7 +598,8 @@ test("getRemoteStylesheets applies fetch limits and parses JSON through the shar
     50,
   );
   await assert.rejects(getRemoteStylesheets(slow, "./Card", { fetchTimeoutMs: 5 }), {
-    name: "AbortError",
+    name: "RemoteFetchError",
+    code: "TANSTACK-REMOTE-FETCH-TIMEOUT",
   });
 });
 

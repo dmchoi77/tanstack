@@ -282,6 +282,18 @@ rendering or hydration recovery instead.
   and on the server, reuses a fetched manifest for 30 seconds (`maxAgeMs`), and
   rejects when the manifest is unreachable or does not list the expose.
 
+Remote manifest fetches throw `RemoteFetchError` from the `runtime` entry. Its
+`code` distinguishes network, timeout, HTTP, response-size, and JSON parse
+failures. HTTP failures preserve `status`, `statusText`, and a normalized
+`bodyPreview` of at most 240 characters; `retryable` is true for network,
+timeout, and transient HTTP failures.
+
+A timeout used to reject with the raw `AbortError`. It now rejects with a
+`RemoteFetchError` whose `code` is `TANSTACK-REMOTE-FETCH-TIMEOUT`, and the
+`AbortError` is its `cause`. `RemoteEntryError.cause` is that `RemoteFetchError`
+too when a server entry cannot be fetched, so check `code` instead of
+`name === "AbortError"`.
+
 ## Remote server functions
 
 A remote's exposed modules can call the remote's `createServerFn`

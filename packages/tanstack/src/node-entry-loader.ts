@@ -3,8 +3,10 @@ import { tanstackStartSharedPackages } from "./shared";
 import {
   DEFAULT_REMOTE_FETCH_TIMEOUT_MS,
   fetchRemoteText,
+  RemoteFetchError,
   type RemoteFetchOptions,
 } from "./remote-fetch";
+import { REMOTE_ERROR_CODES, isRetryableHttpStatus, type RemoteErrorCode } from "./remote-errors";
 export type { RemoteFetchOptions } from "./remote-fetch";
 
 type LoadEntryArgs = Parameters<NonNullable<ModuleFederationRuntimePlugin["loadEntry"]>>[0];
@@ -32,21 +34,41 @@ export interface NodeEntryLoaderOptions extends RemoteFetchOptions {
   strategy?: "temp-file" | "vm";
 }
 
-/** A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the original error. */
+/**
+ * A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the
+ * original error, which is a `RemoteFetchError` whenever the entry's own fetch failed.
+ */
 export class RemoteEntryError extends Error {
+  readonly code: RemoteErrorCode;
   readonly phase: "fetch" | "evaluate" | "loader";
   readonly remote: string;
   readonly url: string;
+  readonly retryable: boolean;
 
   constructor(
     message: string,
-    options: { cause?: unknown; phase: RemoteEntryError["phase"]; remote: string; url: string },
+    options: {
+      cause?: unknown;
+      code?: RemoteErrorCode;
+      phase: RemoteEntryError["phase"];
+      remote: string;
+      url: string;
+      retryable?: boolean;
+    },
   ) {
     super(message, { cause: options.cause });
     this.name = "RemoteEntryError";
+    this.code =
+      options.code ??
+      (options.phase === "fetch"
+        ? REMOTE_ERROR_CODES.remoteFetchNetwork
+        : options.phase === "evaluate"
+          ? REMOTE_ERROR_CODES.remoteEntryEvaluate
+          : REMOTE_ERROR_CODES.remoteEntryLoader);
     this.phase = options.phase;
     this.remote = options.remote;
     this.url = options.url;
+    this.retryable = options.retryable ?? false;
   }
 }
 
@@ -172,6 +194,8 @@ async function loadCommonJsEntry(
       `Could not fetch the server entry of remote "${name}" from ${entry}.`,
       {
         cause,
+        code: cause instanceof RemoteFetchError ? cause.code : undefined,
+        retryable: cause instanceof RemoteFetchError ? cause.retryable : undefined,
         phase: "fetch",
         remote: name,
         url: entry,
@@ -242,7 +266,7 @@ type ViteSsrEntryLoaderModule = {
     fetchMaxBytes?: number;
   }) => ModuleFederationRuntimePlugin;
   revalidate?: (remoteEntryUrl?: string) => void;
-  SsrEntryHttpError?: new (...args: never[]) => Error;
+  SsrEntryHttpError?: new (...args: never[]) => Error & { status?: number };
 };
 
 type ViteLoader = {
@@ -333,6 +357,7 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
       : await viteLoader.plugin.loadEntry?.(args);
   } catch (cause) {
     const { httpError } = viteLoader;
+    const status = httpError && cause instanceof httpError ? cause.status : undefined;
     throw new RemoteEntryError(
       `Could not load the server entry of remote "${name}" from ${entry}.`,
       {
@@ -340,6 +365,11 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
         phase: httpError && cause instanceof httpError ? "fetch" : "evaluate",
         remote: name,
         url: entry,
+        ...(httpError && cause instanceof httpError
+          ? typeof status === "number"
+            ? { code: REMOTE_ERROR_CODES.remoteFetchHttp, retryable: isRetryableHttpStatus(status) }
+            : { code: REMOTE_ERROR_CODES.remoteFetchNetwork, retryable: true }
+          : {}),
       },
     );
   }
@@ -347,20 +377,36 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
   // modules without Node flags. Report the failure instead. The Vite loader returns
   // nothing for an unreachable remote, so tell that case apart.
   if (!remoteEntry) {
-    const reachable = await fetch(entry, {
+    // A status means the remote answered; an error means it never did.
+    const probe = await fetch(entry, {
       method: "HEAD",
       ...requestOptions(options.fetchTimeoutMs),
     }).then(
-      (response) => response.ok,
-      () => false,
+      (response) => ({ ok: response.ok, status: response.status }),
+      (cause: unknown) => ({ cause, ok: false, status: undefined }),
     );
-    throw new RemoteEntryError(
-      reachable
-        ? `@module-federation/vite could not load the server entry of remote "${name}" ` +
-            `from ${entry}; its warnings have the cause.`
-        : `Could not reach remote "${name}" at ${entry}.`,
-      { phase: reachable ? "loader" : "fetch", remote: name, url: entry },
-    );
+    if (probe.ok) {
+      throw new RemoteEntryError(
+        `@module-federation/vite could not load the server entry of remote "${name}" ` +
+          `from ${entry}; its warnings have the cause.`,
+        { phase: "loader", remote: name, url: entry },
+      );
+    }
+    const timedOut =
+      "cause" in probe && probe.cause instanceof Error && probe.cause.name === "TimeoutError";
+    throw new RemoteEntryError(`Could not reach remote "${name}" at ${entry}.`, {
+      cause: "cause" in probe ? probe.cause : undefined,
+      code:
+        probe.status !== undefined
+          ? REMOTE_ERROR_CODES.remoteFetchHttp
+          : timedOut
+            ? REMOTE_ERROR_CODES.remoteFetchTimeout
+            : REMOTE_ERROR_CODES.remoteFetchNetwork,
+      phase: "fetch",
+      remote: name,
+      url: entry,
+      retryable: probe.status === undefined || isRetryableHttpStatus(probe.status),
+    });
   }
   return remoteEntry;
 }
