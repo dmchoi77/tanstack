@@ -77,6 +77,32 @@ test("fetchRemoteText bounds HTTP error previews", async () => {
   });
 });
 
+test("fetchRemoteText fills the preview past collapsed whitespace and whole code points", async () => {
+  const indented = `<html>\n${" ".repeat(400)}<body>${"😀".repeat(300)}</body>`;
+  globalThis.fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          // Small chunks, so the first one alone is nearly all whitespace.
+          const bytes = new TextEncoder().encode(indented);
+          for (let at = 0; at < bytes.length; at += 300) {
+            controller.enqueue(bytes.subarray(at, at + 300));
+          }
+          controller.close();
+        },
+      }),
+      { status: 500 },
+    );
+
+  await assert.rejects(fetchRemoteText("https://remote.test/indented"), (error) => {
+    assert.equal(error.code, "TANSTACK-REMOTE-FETCH-HTTP");
+    assert.equal(Array.from(error.bodyPreview).length, 240);
+    assert.ok(error.bodyPreview.startsWith("<html> <body>😀"));
+    assert.ok(error.bodyPreview.isWellFormed());
+    return true;
+  });
+});
+
 function stalledErrorResponse(signal) {
   return new Response(
     new ReadableStream({
@@ -136,6 +162,7 @@ test("fetchRemoteText classifies network failures as retryable", async () => {
     assert.equal(error.code, "TANSTACK-REMOTE-FETCH-NETWORK");
     assert.equal(error.retryable, true);
     assert.equal(error.cause.message, "socket closed");
+    assert.equal(error.message, "Could not reach https://remote.test/offline: socket closed");
     return true;
   });
 });

@@ -288,6 +288,12 @@ failures. HTTP failures preserve `status`, `statusText`, and a normalized
 `bodyPreview` of at most 240 characters; `retryable` is true for network,
 timeout, and transient HTTP failures.
 
+A timeout used to reject with the raw `AbortError`. It now rejects with a
+`RemoteFetchError` whose `code` is `TANSTACK-REMOTE-FETCH-TIMEOUT`, and the
+`AbortError` is its `cause`. `RemoteEntryError.cause` is that `RemoteFetchError`
+too when a server entry cannot be fetched, so check `code` instead of
+`name === "AbortError"`.
+
 ## Remote server functions
 
 A remote's exposed modules can call the remote's `createServerFn`

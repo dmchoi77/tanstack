@@ -34,7 +34,10 @@ export interface NodeEntryLoaderOptions extends RemoteFetchOptions {
   strategy?: "temp-file" | "vm";
 }
 
-/** A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the original error. */
+/**
+ * A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the
+ * original error, which is a `RemoteFetchError` whenever the entry's own fetch failed.
+ */
 export class RemoteEntryError extends Error {
   readonly code: RemoteErrorCode;
   readonly phase: "fetch" | "evaluate" | "loader";
@@ -190,7 +193,7 @@ async function loadCommonJsEntry(
     throw new RemoteEntryError(
       `Could not fetch the server entry of remote "${name}" from ${entry}.`,
       {
-        cause: cause instanceof RemoteFetchError ? (cause.cause ?? cause) : cause,
+        cause,
         code: cause instanceof RemoteFetchError ? cause.code : undefined,
         retryable: cause instanceof RemoteFetchError ? cause.retryable : undefined,
         phase: "fetch",

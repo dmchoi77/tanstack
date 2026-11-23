@@ -69,20 +69,7 @@ export async function fetchRemoteText(
     try {
       response = await fetch(url, controller ? { signal: controller.signal } : undefined);
     } catch (cause) {
-      if (timedOut) {
-        throw new RemoteFetchError(`${url} did not respond within ${timeoutMs} ms.`, {
-          cause,
-          code: REMOTE_ERROR_CODES.remoteFetchTimeout,
-          retryable: true,
-          url,
-        });
-      }
-      throw new RemoteFetchError(errorMessage(cause), {
-        cause,
-        code: REMOTE_ERROR_CODES.remoteFetchNetwork,
-        retryable: true,
-        url,
-      });
+      throw fetchFailure(url, cause, timedOut ? timeoutMs : undefined);
     }
 
     if (!response.ok) {
@@ -138,20 +125,7 @@ export async function fetchRemoteText(
     }
   } catch (cause) {
     if (cause instanceof RemoteFetchError) throw cause;
-    if (timedOut) {
-      throw new RemoteFetchError(`${url} did not respond within ${timeoutMs} ms.`, {
-        cause,
-        code: REMOTE_ERROR_CODES.remoteFetchTimeout,
-        retryable: true,
-        url,
-      });
-    }
-    throw new RemoteFetchError(errorMessage(cause), {
-      cause,
-      code: REMOTE_ERROR_CODES.remoteFetchNetwork,
-      retryable: true,
-      url,
-    });
+    throw fetchFailure(url, cause, timedOut ? timeoutMs : undefined);
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
@@ -188,7 +162,26 @@ function assertResponseSize(url: string, bytes: number, maxBytes: number) {
   }
 }
 
+/** A request that failed without a usable response: it timed out, or the remote was unreachable. */
+function fetchFailure(url: string, cause: unknown, timedOutAfterMs: number | undefined) {
+  return timedOutAfterMs === undefined
+    ? new RemoteFetchError(`Could not reach ${url}: ${errorMessage(cause)}`, {
+        cause,
+        code: REMOTE_ERROR_CODES.remoteFetchNetwork,
+        retryable: true,
+        url,
+      })
+    : new RemoteFetchError(`${url} did not complete within ${timedOutAfterMs} ms.`, {
+        cause,
+        code: REMOTE_ERROR_CODES.remoteFetchTimeout,
+        retryable: true,
+        url,
+      });
+}
+
 const MAX_BODY_PREVIEW = 240;
+// Whitespace is collapsed, so an indented error page needs more raw text than the preview keeps.
+const MAX_BODY_PREVIEW_BYTES = 16 * 1024;
 const BODY_PREVIEW_TIMEOUT_MS = 1_000;
 
 /** Best effort: returns what arrived before the deadline and never rejects. */
@@ -197,15 +190,17 @@ async function readBodyPreview(response: Response): Promise<string | undefined> 
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
+  let bytes = 0;
   let text = "";
   // Cancelling settles a pending read, so a body that stalls cannot hold the error back.
   const deadline = setTimeout(() => {
     void reader.cancel().catch(() => undefined);
   }, BODY_PREVIEW_TIMEOUT_MS);
   try {
-    while (text.length < MAX_BODY_PREVIEW) {
+    while (bytes < MAX_BODY_PREVIEW_BYTES && previewCodePoints(text).length < MAX_BODY_PREVIEW) {
       const { done, value } = await reader.read();
       if (done) break;
+      bytes += value.byteLength;
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
@@ -218,7 +213,11 @@ async function readBodyPreview(response: Response): Promise<string | undefined> 
   return normalizePreview(text);
 }
 
+/** Collapsed text by code point, so the limit never splits a surrogate pair. */
+function previewCodePoints(text: string) {
+  return Array.from(text.replace(/\s+/g, " ").trim());
+}
+
 function normalizePreview(text: string): string | undefined {
-  const preview = text.replace(/\s+/g, " ").trim().slice(0, MAX_BODY_PREVIEW);
-  return preview || undefined;
+  return previewCodePoints(text).slice(0, MAX_BODY_PREVIEW).join("") || undefined;
 }

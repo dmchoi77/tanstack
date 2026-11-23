@@ -287,7 +287,10 @@ test("times out CommonJS server-entry responses", async () => {
       assert.equal(error.phase, "fetch");
       assert.equal(error.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
       assert.equal(error.retryable, true);
-      assert.equal(error.cause.name, "AbortError");
+      // The fetch error stays whole, with the abort beneath it.
+      assert.equal(error.cause.name, "RemoteFetchError");
+      assert.equal(error.cause.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
+      assert.equal(error.cause.cause.name, "AbortError");
       return true;
     },
   );
