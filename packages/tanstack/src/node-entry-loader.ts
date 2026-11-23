@@ -3,8 +3,10 @@ import { tanstackStartSharedPackages } from "./shared";
 import {
   DEFAULT_REMOTE_FETCH_TIMEOUT_MS,
   fetchRemoteText,
+  RemoteFetchError,
   type RemoteFetchOptions,
 } from "./remote-fetch";
+import { REMOTE_ERROR_CODES, type RemoteErrorCode } from "./remote-errors";
 export type { RemoteFetchOptions } from "./remote-fetch";
 
 type LoadEntryArgs = Parameters<NonNullable<ModuleFederationRuntimePlugin["loadEntry"]>>[0];
@@ -34,19 +36,36 @@ export interface NodeEntryLoaderOptions extends RemoteFetchOptions {
 
 /** A remote's server entry failed to load. `phase` says which step failed; `cause` keeps the original error. */
 export class RemoteEntryError extends Error {
+  readonly code: RemoteErrorCode;
   readonly phase: "fetch" | "evaluate" | "loader";
   readonly remote: string;
   readonly url: string;
+  readonly retryable: boolean;
 
   constructor(
     message: string,
-    options: { cause?: unknown; phase: RemoteEntryError["phase"]; remote: string; url: string },
+    options: {
+      cause?: unknown;
+      code?: RemoteErrorCode;
+      phase: RemoteEntryError["phase"];
+      remote: string;
+      url: string;
+      retryable?: boolean;
+    },
   ) {
     super(message, { cause: options.cause });
     this.name = "RemoteEntryError";
+    this.code =
+      options.code ??
+      (options.phase === "fetch"
+        ? REMOTE_ERROR_CODES.remoteFetchNetwork
+        : options.phase === "evaluate"
+          ? REMOTE_ERROR_CODES.remoteEntryEvaluate
+          : REMOTE_ERROR_CODES.remoteEntryLoader);
     this.phase = options.phase;
     this.remote = options.remote;
     this.url = options.url;
+    this.retryable = options.retryable ?? false;
   }
 }
 
@@ -171,7 +190,9 @@ async function loadCommonJsEntry(
     throw new RemoteEntryError(
       `Could not fetch the server entry of remote "${name}" from ${entry}.`,
       {
-        cause,
+        cause: cause instanceof RemoteFetchError ? (cause.cause ?? cause) : cause,
+        code: cause instanceof RemoteFetchError ? cause.code : undefined,
+        retryable: cause instanceof RemoteFetchError ? cause.retryable : undefined,
         phase: "fetch",
         remote: name,
         url: entry,

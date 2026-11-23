@@ -1,7 +1,10 @@
 import { createElement, lazy, type ComponentProps, type ComponentType } from "react";
 import { fetchRemoteJson, type RemoteFetchOptions } from "./remote-fetch";
+import type { RemoteErrorCode, RemoteErrorEvent, RemoteErrorReporter } from "./remote-errors";
 
-export type { RemoteFetchOptions } from "./remote-fetch";
+export { RemoteFetchError } from "./remote-fetch";
+export { REMOTE_ERROR_CODES, REMOTE_ERROR_DESCRIPTIONS } from "./remote-errors";
+export type { RemoteFetchOptions, RemoteErrorCode, RemoteErrorEvent, RemoteErrorReporter };
 
 export type LazyRemoteOptions = {
   /** How long a failed load stays failed before a render tries again, in milliseconds. Defaults to 5 seconds. */

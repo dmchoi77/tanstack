@@ -624,6 +624,10 @@ test("runtime subpaths load without a bundler adapter", () => {
     const loader = consumerRequire("@module-federation/tanstack/node-entry-loader");
     assert.equal(typeof runtime.getRemoteStylesheets, "function");
     assert.equal(typeof runtime.lazyRemote, "function");
+    assert.equal(typeof runtime.RemoteFetchError, "function");
+    assert.equal(typeof runtime.REMOTE_ERROR_CODES, "object");
+    assert.equal(typeof runtime.REMOTE_ERROR_DESCRIPTIONS, "object");
+    assert.equal(runtime.REMOTE_ERROR_CODES.remoteFetchTimeout, "TANSTACK-REMOTE-FETCH-TIMEOUT");
     assert.equal(typeof loader.default, "function");
     assert.equal(typeof loader.RemoteEntryError, "function");
   } finally {

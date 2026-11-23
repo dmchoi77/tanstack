@@ -285,6 +285,8 @@ test("times out CommonJS server-entry responses", async () => {
     (error) => {
       assert.ok(error instanceof RemoteEntryError);
       assert.equal(error.phase, "fetch");
+      assert.equal(error.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
+      assert.equal(error.retryable, true);
       assert.equal(error.cause.name, "AbortError");
       return true;
     },
@@ -568,7 +570,8 @@ test("getRemoteStylesheets applies fetch limits and parses JSON through the shar
     50,
   );
   await assert.rejects(getRemoteStylesheets(slow, "./Card", { fetchTimeoutMs: 5 }), {
-    name: "AbortError",
+    name: "RemoteFetchError",
+    code: "TANSTACK-REMOTE-FETCH-TIMEOUT",
   });
 });
 

@@ -13,6 +13,10 @@ test("published declarations reference included source maps", () => {
   for (const declarationName of [
     "index.d.cts",
     "index.d.ts",
+    "remote-errors.d.cts",
+    "remote-errors.d.ts",
+    "remote-fetch.d.cts",
+    "remote-fetch.d.ts",
     "node-entry-loader.d.cts",
     "node-entry-loader.d.ts",
     "rsbuild.d.cts",
@@ -48,6 +52,7 @@ test("npm package contains only runtime, metadata, and documentation files", () 
   const entries = [
     "index",
     "node-entry-loader",
+    "remote-errors",
     "remote-fetch",
     "rsbuild",
     "runtime",
