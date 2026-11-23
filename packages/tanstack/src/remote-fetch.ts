@@ -86,19 +86,8 @@ export async function fetchRemoteText(
     }
 
     if (!response.ok) {
-      let bodyPreview: string | undefined;
-      try {
-        bodyPreview = await readBodyPreview(response);
-      } catch (cause) {
-        if (timedOut) {
-          throw new RemoteFetchError(`${url} did not respond within ${timeoutMs} ms.`, {
-            cause,
-            code: REMOTE_ERROR_CODES.remoteFetchTimeout,
-            retryable: true,
-            url,
-          });
-        }
-      }
+      // The status is already known, so a slow or stalled body must not delay or reclassify it.
+      const bodyPreview = await readBodyPreview(response);
       throw new RemoteFetchError(`${url} responded with HTTP ${response.status}.`, {
         bodyPreview,
         code: REMOTE_ERROR_CODES.remoteFetchHttp,
@@ -200,16 +189,19 @@ function assertResponseSize(url: string, bytes: number, maxBytes: number) {
 }
 
 const MAX_BODY_PREVIEW = 240;
+const BODY_PREVIEW_TIMEOUT_MS = 1_000;
 
+/** Best effort: returns what arrived before the deadline and never rejects. */
 async function readBodyPreview(response: Response): Promise<string | undefined> {
-  if (!response.body) {
-    const text = await response.text();
-    return normalizePreview(text);
-  }
+  if (!response.body) return undefined;
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let text = "";
+  // Cancelling settles a pending read, so a body that stalls cannot hold the error back.
+  const deadline = setTimeout(() => {
+    void reader.cancel().catch(() => undefined);
+  }, BODY_PREVIEW_TIMEOUT_MS);
   try {
     while (text.length < MAX_BODY_PREVIEW) {
       const { done, value } = await reader.read();
@@ -217,10 +209,13 @@ async function readBodyPreview(response: Response): Promise<string | undefined> 
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
-    return normalizePreview(text);
+  } catch {
+    // Keep whatever was read before the body failed or the request timed out.
   } finally {
+    clearTimeout(deadline);
     await reader.cancel().catch(() => undefined);
   }
+  return normalizePreview(text);
 }
 
 function normalizePreview(text: string): string | undefined {

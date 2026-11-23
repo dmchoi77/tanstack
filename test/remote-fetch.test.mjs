@@ -77,29 +77,35 @@ test("fetchRemoteText bounds HTTP error previews", async () => {
   });
 });
 
-test("fetchRemoteText classifies a timeout while reading an HTTP error preview", async () => {
-  globalThis.fetch = async (_url, { signal }) =>
-    new Response(
-      new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("partial"));
-          signal.addEventListener("abort", () => controller.error(signal.reason), {
-            once: true,
-          });
-        },
-      }),
-      { status: 404 },
-    );
-
-  await assert.rejects(
-    fetchRemoteText("https://remote.test/stalled", { fetchTimeoutMs: 5 }),
-    (error) => {
-      assert.ok(error instanceof RemoteFetchError);
-      assert.equal(error.code, "TANSTACK-REMOTE-FETCH-TIMEOUT");
-      assert.equal(error.retryable, true);
-      return true;
-    },
+function stalledErrorResponse(signal) {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("partial"));
+        signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+      },
+    }),
+    { status: 404 },
   );
+}
+
+test("fetchRemoteText keeps the HTTP status when the error body stalls", async () => {
+  globalThis.fetch = async (_url, init) => stalledErrorResponse(init?.signal);
+
+  // With a timeout the abort ends the preview; without one the preview deadline does.
+  for (const fetchTimeoutMs of [5, 0]) {
+    await assert.rejects(
+      fetchRemoteText("https://remote.test/stalled", { fetchTimeoutMs }),
+      (error) => {
+        assert.ok(error instanceof RemoteFetchError);
+        assert.equal(error.code, "TANSTACK-REMOTE-FETCH-HTTP");
+        assert.equal(error.status, 404);
+        assert.equal(error.retryable, false);
+        assert.equal(error.bodyPreview, "partial");
+        return true;
+      },
+    );
+  }
 });
 
 test("fetchRemoteText aborts a request that exceeds the timeout", async () => {
