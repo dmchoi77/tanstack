@@ -6,11 +6,7 @@ import {
   RemoteFetchError,
   type RemoteFetchOptions,
 } from "./remote-fetch";
-import {
-  REMOTE_ERROR_CODES,
-  isRetryableHttpStatus,
-  type RemoteErrorCode,
-} from "./remote-errors";
+import { REMOTE_ERROR_CODES, isRetryableHttpStatus, type RemoteErrorCode } from "./remote-errors";
 export type { RemoteFetchOptions } from "./remote-fetch";
 
 type LoadEntryArgs = Parameters<NonNullable<ModuleFederationRuntimePlugin["loadEntry"]>>[0];
