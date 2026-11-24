@@ -15,11 +15,13 @@
     "typecheck": "turbo run typecheck",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "prepare": "husky",
     "pack:tanstack": "pnpm --filter @module-federation/tanstack pack:dry",
     "start": "pnpm build:package && turbo run start",
     "preview": "pnpm build && turbo run preview"
   },
   "devDependencies": {
+    "husky": "9.1.7",
     "playwright": "1.63.0",
     "prettier": "3.9.9",
     "turbo": "2.11.7",
