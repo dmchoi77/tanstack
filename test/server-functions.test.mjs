@@ -6,8 +6,12 @@ import { after, before, test } from "node:test";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "packages", "tanstack", "dist");
-const { createRemoteServerFunctions, fetchRemoteServerFunction, remoteServerFunctionBase } =
-  await import(pathToFileURL(join(dist, "server-functions.js")).href);
+const {
+  createRemoteServerFunctions,
+  fetchRemoteServerFunction,
+  RemoteServerFunctionError,
+  remoteServerFunctionBase,
+} = await import(pathToFileURL(join(dist, "server-functions.js")).href);
 
 const host = "http://host.test";
 const base = remoteServerFunctionBase("catalog");
@@ -159,17 +163,35 @@ test("rejects other methods and malformed function paths", async () => {
 });
 
 test("answers 502 when the remote is unreachable or slow to respond", async () => {
+  const events = [];
   const offline = createRemoteServerFunctions({
     remotes: { catalog: { origin: "http://127.0.0.1:9" } },
+    onError(event) {
+      events.push(event);
+      throw new Error("reporter failed");
+    },
   });
-  assert.equal((await offline.handle(call(`${base}fn-5`))).status, 502);
+  const offlineResponse = await offline.handle(call(`${base}fn-5`));
+  assert.equal(offlineResponse.status, 502);
+  assert.equal(await offlineResponse.text(), 'Remote "catalog" is unavailable');
+  assert.deepEqual(
+    {
+      code: events[0].code,
+      remote: events[0].remote,
+      retryable: events[0].retryable,
+    },
+    { code: "TANSTACK-SERVER-FUNCTION-NETWORK", remote: "catalog", retryable: true },
+  );
 
+  const timeoutEvents = [];
   const slow = createRemoteServerFunctions({
     remotes: { catalog: { origin: remoteOrigin, timeoutMs: 100 } },
+    onError: (event) => timeoutEvents.push(event),
   });
   const started = Date.now();
   assert.equal((await slow.handle(call(`${base}slow-headers`))).status, 502);
   assert.ok(Date.now() - started < 450, "gives up after the timeout");
+  assert.equal(timeoutEvents[0].code, "TANSTACK-SERVER-FUNCTION-TIMEOUT");
 });
 
 test("the timeout does not cut off a response that is still streaming", async () => {
@@ -189,13 +211,94 @@ test("resolves a function origin on every call and rejects non-HTTP origins", as
   origin = "http://127.0.0.1:9";
   assert.equal((await handle(call(`${base}fn-6`))).status, 502);
 
+  const events = [];
   assert.throws(
-    () => createRemoteServerFunctions({ remotes: { catalog: { origin: "file:///etc" } } }),
-    /needs an http or https origin/,
+    () =>
+      createRemoteServerFunctions({
+        onError: (event) => events.push(event),
+        remotes: { catalog: { origin: "file:///etc" } },
+      }),
+    (error) =>
+      error instanceof RemoteServerFunctionError &&
+      /needs an http or https origin/.test(error.message),
   );
+  assert.equal(events[0].code, "TANSTACK-SERVER-FUNCTION-CONFIG");
+  const dynamicEvents = [];
+  const dynamic = createRemoteServerFunctions({
+    onError: (event) => dynamicEvents.push(event),
+    remotes: {
+      catalog: {
+        origin: () => {
+          throw new Error("missing config");
+        },
+      },
+    },
+  });
+  assert.equal((await dynamic.handle(call(`${base}fn-6`))).status, 502);
+  assert.equal(dynamicEvents[0].code, "TANSTACK-SERVER-FUNCTION-CONFIG");
+  assert.equal(dynamicEvents[0].retryable, false);
+
+  const headerEvents = [];
+  const invalidHeaders = createRemoteServerFunctions({
+    onError: (event) => headerEvents.push(event),
+    remotes: {
+      catalog: {
+        headers: () => ({ "\n": "invalid" }),
+        origin: remoteOrigin,
+      },
+    },
+  });
+  assert.equal((await invalidHeaders.handle(call(`${base}fn-invalid-headers`))).status, 502);
+  assert.equal(headerEvents[0].code, "TANSTACK-SERVER-FUNCTION-CONFIG");
+  assert.equal(headerEvents[0].retryable, false);
+
   assert.throws(
     () => createRemoteServerFunctions({ remotes: { "../x": { origin: remoteOrigin } } }),
     /Invalid remote name/,
+  );
+});
+
+test("does not report or convert caller aborts", async () => {
+  const events = [];
+  const { handle } = createRemoteServerFunctions({
+    onError: (event) => events.push(event),
+    remotes: { catalog: { origin: remoteOrigin } },
+  });
+  const controller = new AbortController();
+  const pending = handle(call(`${base}slow-headers`, { signal: controller.signal }));
+  controller.abort();
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+  assert.equal(events.length, 0);
+});
+
+test("reports server-rendering failures with a structured error", async () => {
+  const events = [];
+  createRemoteServerFunctions({
+    onError: (event) => events.push(event),
+    remotes: { catalog: { origin: remoteOrigin } },
+  });
+  await assert.rejects(
+    fetchRemoteServerFunction("catalog", `${base}fn-remote`, {}, async () => {
+      throw new Error("remote offline");
+    }),
+    (error) =>
+      error instanceof RemoteServerFunctionError &&
+      error.code === "TANSTACK-SERVER-FUNCTION-NETWORK" &&
+      error.remote === "catalog",
+  );
+  assert.deepEqual(
+    {
+      code: events[0].code,
+      remote: events[0].remote,
+      retryable: events[0].retryable,
+      url: events[0].url,
+    },
+    {
+      code: "TANSTACK-SERVER-FUNCTION-NETWORK",
+      remote: "catalog",
+      retryable: true,
+      url: `${remoteOrigin}${base}fn-remote`,
+    },
   );
 });
 
