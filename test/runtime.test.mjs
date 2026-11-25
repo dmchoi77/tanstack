@@ -329,14 +329,48 @@ test("revalidates a Vite SSR entry after maxAgeMs expires", async () => {
 });
 
 test("reports which step failed and keeps the cause", async () => {
-  await assert.rejects(loadEntry(`${origin}/missing/remoteEntry.ssr.cjs`), (error) => {
-    assert.ok(error instanceof RemoteEntryError);
-    assert.equal(error.phase, "fetch");
-    assert.equal(error.remote, "remote");
-    assert.equal(error.url, `${origin}/missing/remoteEntry.ssr.cjs`);
-    assert.match(error.cause.message, /HTTP 404/);
-    return true;
-  });
+  const events = [];
+  await assert.rejects(
+    nodeEntryLoader({
+      async onError(event) {
+        events.push(event);
+        throw new Error("reporter failed");
+      },
+    }).loadEntry({
+      origin: {},
+      remoteInfo: {
+        entry: `${origin}/missing/remoteEntry.ssr.cjs`,
+        entryGlobalName: "remote",
+        name: "remote",
+        type: "commonjs-module",
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof RemoteEntryError);
+      assert.equal(error.phase, "fetch");
+      assert.equal(error.remote, "remote");
+      assert.equal(error.url, `${origin}/missing/remoteEntry.ssr.cjs`);
+      assert.match(error.cause.message, /HTTP 404/);
+      return true;
+    },
+  );
+  assert.equal(events.length, 1);
+  assert.deepEqual(
+    {
+      code: events[0].code,
+      phase: events[0].phase,
+      retryable: events[0].retryable,
+      status: events[0].status,
+      url: events[0].url,
+    },
+    {
+      code: "TANSTACK-REMOTE-FETCH-HTTP",
+      phase: "fetch",
+      retryable: false,
+      status: 404,
+      url: `${origin}/missing/remoteEntry.ssr.cjs`,
+    },
+  );
 
   const closed = createServer();
   await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
@@ -522,6 +556,34 @@ test("Vite remotes classify fetch failures by what the remote answered", async (
     phase: "fetch",
     retryable: false,
   });
+});
+
+test("Vite remote failures are reported once with HTTP metadata", async () => {
+  const outcome = await runInHost(`
+    const events = [];
+    const origin = { name: "host", options: { shared: {} }, shareScopeMap: {} };
+    const error = await loader({ onError: (event) => events.push({
+      code: event.code,
+      phase: event.phase,
+      retryable: event.retryable,
+      status: event.status,
+      url: event.url,
+    }) }).loadEntry({
+      origin,
+      remoteInfo: { entry: ${JSON.stringify(`${origin}/vite-missing-observed/remoteEntry.js`)}, name: "vite_remote", type: "module" },
+    }).catch((error) => error);
+    console.log(JSON.stringify({ error: error.code, events }));
+  `);
+  assert.equal(outcome.error, "TANSTACK-REMOTE-FETCH-HTTP");
+  assert.deepEqual(outcome.events, [
+    {
+      code: "TANSTACK-REMOTE-FETCH-HTTP",
+      phase: "fetch",
+      retryable: false,
+      status: 404,
+      url: `${origin}/vite-missing-observed/remoteEntry.js`,
+    },
+  ]);
 });
 
 test("getRemoteStylesheets resolves an expose's CSS from its manifest", async () => {

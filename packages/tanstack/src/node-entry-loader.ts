@@ -6,8 +6,15 @@ import {
   RemoteFetchError,
   type RemoteFetchOptions,
 } from "./remote-fetch";
-import { REMOTE_ERROR_CODES, isRetryableHttpStatus, type RemoteErrorCode } from "./remote-errors";
+import {
+  REMOTE_ERROR_CODES,
+  isRetryableHttpStatus,
+  reportRemoteError,
+  type RemoteErrorCode,
+  type RemoteErrorReporter,
+} from "./remote-errors";
 export type { RemoteFetchOptions } from "./remote-fetch";
+export type { RemoteErrorEvent, RemoteErrorPhase, RemoteErrorReporter } from "./remote-errors";
 
 type LoadEntryArgs = Parameters<NonNullable<ModuleFederationRuntimePlugin["loadEntry"]>>[0];
 type RemoteEntryExports = NonNullable<LoadEntryArgs["remoteEntryExports"]>;
@@ -32,6 +39,8 @@ export interface NodeEntryLoaderOptions extends RemoteFetchOptions {
   maxAgeMs?: number;
   /** Revalidation strategy used by the Vite SSR entry loader. */
   strategy?: "temp-file" | "vm";
+  /** Receives structured remote entry failures. Callback errors are ignored. */
+  onError?: RemoteErrorReporter;
 }
 
 /**
@@ -44,6 +53,9 @@ export class RemoteEntryError extends Error {
   readonly remote: string;
   readonly url: string;
   readonly retryable: boolean;
+  readonly status?: number;
+  readonly statusText?: string;
+  readonly bodyPreview?: string;
 
   constructor(
     message: string,
@@ -54,6 +66,9 @@ export class RemoteEntryError extends Error {
       remote: string;
       url: string;
       retryable?: boolean;
+      status?: number;
+      statusText?: string;
+      bodyPreview?: string;
     },
   ) {
     super(message, { cause: options.cause });
@@ -69,6 +84,9 @@ export class RemoteEntryError extends Error {
     this.remote = options.remote;
     this.url = options.url;
     this.retryable = options.retryable ?? false;
+    this.status = options.status;
+    this.statusText = options.statusText;
+    this.bodyPreview = options.bodyPreview;
   }
 }
 
@@ -184,23 +202,28 @@ function resolvePackageRoot(specifier: string, require: NodeJS.Require) {
 
 async function loadCommonJsEntry(
   { entry, entryGlobalName, name }: RemoteInfo,
-  options: RemoteFetchOptions,
+  options: NodeEntryLoaderOptions,
 ) {
   let source: string;
   try {
     source = await fetchRemoteText(entry, options);
   } catch (cause) {
-    throw new RemoteEntryError(
+    const error = new RemoteEntryError(
       `Could not fetch the server entry of remote "${name}" from ${entry}.`,
       {
         cause,
         code: cause instanceof RemoteFetchError ? cause.code : undefined,
         retryable: cause instanceof RemoteFetchError ? cause.retryable : undefined,
+        status: cause instanceof RemoteFetchError ? cause.status : undefined,
+        statusText: cause instanceof RemoteFetchError ? cause.statusText : undefined,
+        bodyPreview: cause instanceof RemoteFetchError ? cause.bodyPreview : undefined,
         phase: "fetch",
         remote: name,
         url: entry,
       },
     );
+    reportEntryError(options.onError, error);
+    throw error;
   }
 
   let exports: Record<string, unknown>;
@@ -214,20 +237,27 @@ async function loadCommonJsEntry(
     container._compile(source, entry, "commonjs");
     exports = container.exports as Record<string, unknown>;
   } catch (cause) {
-    throw new RemoteEntryError(`The server entry of remote "${name}" threw while loading.`, {
-      cause,
-      phase: "evaluate",
-      remote: name,
-      url: entry,
-    });
+    const error = new RemoteEntryError(
+      `The server entry of remote "${name}" threw while loading.`,
+      {
+        cause,
+        phase: "evaluate",
+        remote: name,
+        url: entry,
+      },
+    );
+    reportEntryError(options.onError, error);
+    throw error;
   }
 
   const remoteEntry = (entryGlobalName && exports[entryGlobalName]) || exports;
   if (!isRemoteEntry(remoteEntry)) {
-    throw new RemoteEntryError(
+    const error = new RemoteEntryError(
       `The server entry of remote "${name}" did not export a federation container.`,
       { phase: "evaluate", remote: name, url: entry },
     );
+    reportEntryError(options.onError, error);
+    throw error;
   }
   return remoteEntry;
 }
@@ -266,7 +296,11 @@ type ViteSsrEntryLoaderModule = {
     fetchMaxBytes?: number;
   }) => ModuleFederationRuntimePlugin;
   revalidate?: (remoteEntryUrl?: string) => void;
-  SsrEntryHttpError?: new (...args: never[]) => Error & { status?: number };
+  SsrEntryHttpError?: new (...args: never[]) => Error & {
+    bodyPreview?: string;
+    status?: number;
+    statusText?: string;
+  };
 };
 
 type ViteLoader = {
@@ -343,7 +377,19 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
   const { entry, name } = args.remoteInfo;
   let viteLoader = viteLoaders.get(args.origin);
   if (!viteLoader) {
-    viteLoader = createViteLoader(args, options);
+    try {
+      viteLoader = createViteLoader(args, options);
+    } catch (cause) {
+      const error =
+        cause instanceof RemoteEntryError
+          ? cause
+          : new RemoteEntryError(
+              `Could not initialize the Vite server entry loader for remote "${name}".`,
+              { cause, phase: "loader", remote: name, url: entry },
+            );
+      reportEntryError(options.onError, error);
+      throw error;
+    }
     viteLoaders.set(args.origin, viteLoader);
   }
   // Shared modules the host loaded since the last remote are aligned too.
@@ -356,22 +402,38 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
       ? await loadViteDevEntry(devEntry, viteLoader)
       : await viteLoader.plugin.loadEntry?.(args);
   } catch (cause) {
+    if (cause instanceof RemoteEntryError) {
+      reportEntryError(options.onError, cause);
+      throw cause;
+    }
     const { httpError } = viteLoader;
-    const status = httpError && cause instanceof httpError ? cause.status : undefined;
-    throw new RemoteEntryError(
+    const isHttpError = Boolean(httpError && cause instanceof httpError);
+    const viteHttpCause = isHttpError
+      ? (cause as Error & { bodyPreview?: string; status?: number; statusText?: string })
+      : undefined;
+    const status = viteHttpCause?.status;
+    const error = new RemoteEntryError(
       `Could not load the server entry of remote "${name}" from ${entry}.`,
       {
         cause,
-        phase: httpError && cause instanceof httpError ? "fetch" : "evaluate",
+        phase: isHttpError ? "fetch" : "evaluate",
         remote: name,
         url: entry,
-        ...(httpError && cause instanceof httpError
+        ...(isHttpError
           ? typeof status === "number"
-            ? { code: REMOTE_ERROR_CODES.remoteFetchHttp, retryable: isRetryableHttpStatus(status) }
+            ? {
+                bodyPreview: viteHttpCause?.bodyPreview,
+                code: REMOTE_ERROR_CODES.remoteFetchHttp,
+                retryable: isRetryableHttpStatus(status),
+                status,
+                statusText: viteHttpCause?.statusText,
+              }
             : { code: REMOTE_ERROR_CODES.remoteFetchNetwork, retryable: true }
           : {}),
       },
     );
+    reportEntryError(options.onError, error);
+    throw error;
   }
   // Without an entry the runtime would try its own Node loader, which cannot load ES
   // modules without Node flags. Report the failure instead. The Vite loader returns
@@ -386,15 +448,17 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
       (cause: unknown) => ({ cause, ok: false, status: undefined }),
     );
     if (probe.ok) {
-      throw new RemoteEntryError(
+      const error = new RemoteEntryError(
         `@module-federation/vite could not load the server entry of remote "${name}" ` +
           `from ${entry}; its warnings have the cause.`,
         { phase: "loader", remote: name, url: entry },
       );
+      reportEntryError(options.onError, error);
+      throw error;
     }
     const timedOut =
       "cause" in probe && probe.cause instanceof Error && probe.cause.name === "TimeoutError";
-    throw new RemoteEntryError(`Could not reach remote "${name}" at ${entry}.`, {
+    const error = new RemoteEntryError(`Could not reach remote "${name}" at ${entry}.`, {
       cause: "cause" in probe ? probe.cause : undefined,
       code:
         probe.status !== undefined
@@ -406,7 +470,10 @@ async function loadModuleEntry(args: LoadEntryArgs, options: NodeEntryLoaderOpti
       remote: name,
       url: entry,
       retryable: probe.status === undefined || isRetryableHttpStatus(probe.status),
+      status: probe.status,
     });
+    reportEntryError(options.onError, error);
+    throw error;
   }
   return remoteEntry;
 }
@@ -528,13 +595,28 @@ function createViteLoader(
   }
   // The loader is an ES module; Node 22.12+ requires it synchronously.
   const loaderModule = loader.require(loader.path) as ViteSsrEntryLoaderModule;
+  const { onError: _, ...loaderOptions } = options;
   return {
     httpError: loaderModule.SsrEntryHttpError,
-    plugin: loaderModule.default({ resolvedShared, ...options }),
+    plugin: loaderModule.default({ resolvedShared, ...loaderOptions }),
     revalidate: loaderModule.revalidate,
     require: loader.require,
     resolvedShared,
   };
+}
+
+function reportEntryError(reporter: RemoteErrorReporter | undefined, error: RemoteEntryError) {
+  reportRemoteError(reporter, {
+    bodyPreview: error.bodyPreview,
+    code: error.code,
+    error,
+    phase: error.phase,
+    remote: error.remote,
+    retryable: error.retryable,
+    status: error.status,
+    statusText: error.statusText,
+    url: error.url,
+  });
 }
 
 function isRevalidationEnabled(maxAgeMs: number | undefined): maxAgeMs is number {

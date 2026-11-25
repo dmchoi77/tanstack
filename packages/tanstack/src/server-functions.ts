@@ -8,6 +8,16 @@
 // The container is bundled separately from the host, so the configuration lives on
 // `globalThis`.
 
+import {
+  REMOTE_ERROR_CODES,
+  errorMessage,
+  reportRemoteError,
+  type RemoteErrorCode,
+  type RemoteErrorReporter,
+} from "./remote-errors";
+
+export type { RemoteErrorEvent, RemoteErrorReporter } from "./remote-errors";
+
 const REGISTRY_KEY = Symbol.for("module-federation:tanstack:remote-server-functions");
 // TanStack Start keeps its request context in one AsyncLocalStorage on `globalThis`, so
 // every copy of Start in the process, including a remote container's, sees the same request.
@@ -53,7 +63,34 @@ export type RemoteServerFunctionsTarget = {
 export type RemoteServerFunctionsOptions = {
   /** The remotes whose server functions the host routes, by their federation `name`. */
   remotes: Record<string, RemoteServerFunctionsTarget>;
+  /** Receives structured server function failures. Callback errors are ignored. */
+  onError?: RemoteErrorReporter;
 };
+
+export class RemoteServerFunctionError extends Error {
+  readonly code: RemoteErrorCode;
+  readonly remote: string;
+  readonly url?: string;
+  readonly retryable: boolean;
+
+  constructor(
+    message: string,
+    options: {
+      cause?: unknown;
+      code: RemoteErrorCode;
+      remote: string;
+      retryable: boolean;
+      url?: string;
+    },
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "RemoteServerFunctionError";
+    this.code = options.code;
+    this.remote = options.remote;
+    this.retryable = options.retryable;
+    this.url = options.url;
+  }
+}
 
 export type RemoteServerFunctions = {
   /**
@@ -75,13 +112,21 @@ export function remoteServerFunctionBase(name: string): string {
  */
 export function createRemoteServerFunctions({
   remotes,
+  onError,
 }: RemoteServerFunctionsOptions): RemoteServerFunctions {
-  const targets = new Map<string, RemoteServerFunctionsTarget>();
+  const targets = new Map<string, RegisteredTarget>();
   for (const [name, target] of Object.entries(remotes)) {
     if (!REMOTE_NAME.test(name)) throw new Error(`Invalid remote name "${name}"`);
-    if (typeof target.origin === "string") resolveOrigin(name, target);
-    targets.set(name, target);
-    registry().set(name, target);
+    try {
+      if (typeof target.origin === "string") resolveOrigin(name, target);
+    } catch (cause) {
+      const error = asRemoteServerFunctionError(cause, name);
+      reportServerFunctionError(onError, error);
+      throw error;
+    }
+    const registeredTarget = { ...target, onError };
+    targets.set(name, registeredTarget);
+    registry().set(name, registeredTarget);
   }
 
   return {
@@ -118,7 +163,13 @@ export function fetchRemoteServerFunction(
       ),
     );
   }
-  return fetchRemote(name, target, path, init, currentStartRequest(), fetchImpl);
+  const request = currentStartRequest();
+  return fetchRemote(name, target, path, init, request, fetchImpl).catch((cause) => {
+    if (init.signal?.aborted || request?.signal.aborted) throw cause;
+    const error = asRemoteServerFunctionError(cause, name);
+    reportServerFunctionError(target.onError, error);
+    throw error;
+  });
 }
 
 async function forward(
@@ -126,7 +177,7 @@ async function forward(
   url: URL,
   name: string,
   base: string,
-  target: RemoteServerFunctionsTarget,
+  target: RegisteredTarget,
 ): Promise<Response> {
   const functionId = url.pathname.slice(base.length);
   if (!functionId || /[/%]/.test(functionId) || functionId === "." || functionId === "..") {
@@ -164,6 +215,8 @@ async function forward(
     );
   } catch (error) {
     if (request.signal.aborted) throw error;
+    const remoteError = asRemoteServerFunctionError(error, name, url.toString());
+    reportServerFunctionError(target.onError, remoteError);
     return new Response(`Remote "${name}" is unavailable`, { status: 502 });
   }
 
@@ -178,28 +231,44 @@ async function forward(
 
 async function fetchRemote(
   name: string,
-  target: RemoteServerFunctionsTarget,
+  target: RegisteredTarget,
   path: string,
   init: RequestInit,
   request: Request | undefined,
   fetchImpl: typeof fetch,
 ): Promise<Response> {
   const origin = resolveOrigin(name, target);
+  const url = new URL(path, origin).toString();
   const headers = new Headers(init.headers);
-  const extraHeaders = await target.headers?.({ request });
-  if (extraHeaders) new Headers(extraHeaders).forEach((value, key) => headers.set(key, value));
+  let extraHeaders: HeadersInit | undefined;
+  try {
+    extraHeaders = await target.headers?.({ request });
+    if (extraHeaders) new Headers(extraHeaders).forEach((value, key) => headers.set(key, value));
+  } catch (cause) {
+    throw new RemoteServerFunctionError(
+      `Could not prepare headers for remote "${name}" server function.`,
+      {
+        cause,
+        code: REMOTE_ERROR_CODES.remoteServerFunctionConfig,
+        remote: name,
+        retryable: false,
+        url,
+      },
+    );
+  }
   // Server-to-server calls carry no browser headers, so they present the remote's origin to
   // pass its cross-site request check.
   headers.set("origin", origin);
 
   const timeoutMs = target.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const timeout = new AbortController();
+  let timedOut = false;
   const timer =
     timeoutMs > 0
-      ? setTimeout(
-          () => timeout.abort(new Error(`Remote "${name}" did not respond in ${timeoutMs} ms`)),
-          timeoutMs,
-        )
+      ? setTimeout(() => {
+          timedOut = true;
+          timeout.abort(new Error(`Remote "${name}" did not respond in ${timeoutMs} ms`));
+        }, timeoutMs)
       : undefined;
   const signals = [timeout.signal, init.signal, request?.signal].filter(
     (signal): signal is AbortSignal => Boolean(signal),
@@ -212,21 +281,61 @@ async function fetchRemote(
       redirect: "manual",
       signal: AbortSignal.any(signals),
     });
+  } catch (cause) {
+    if (init.signal?.aborted || request?.signal.aborted) throw cause;
+    throw new RemoteServerFunctionError(
+      timedOut
+        ? `Remote "${name}" did not respond in ${timeoutMs} ms.`
+        : `Could not reach remote "${name}" at ${url}: ${errorMessage(cause)}`,
+      {
+        cause,
+        code: timedOut
+          ? REMOTE_ERROR_CODES.remoteServerFunctionTimeout
+          : REMOTE_ERROR_CODES.remoteServerFunctionNetwork,
+        remote: name,
+        retryable: true,
+        url,
+      },
+    );
   } finally {
     clearTimeout(timer);
   }
 }
 
 function resolveOrigin(name: string, target: RemoteServerFunctionsTarget): string {
-  const value = typeof target.origin === "function" ? target.origin() : target.origin;
+  let value: string;
+  try {
+    value = typeof target.origin === "function" ? target.origin() : target.origin;
+  } catch (cause) {
+    throw new RemoteServerFunctionError(
+      `Could not resolve the origin of remote "${name}" server functions.`,
+      {
+        cause,
+        code: REMOTE_ERROR_CODES.remoteServerFunctionConfig,
+        remote: name,
+        retryable: false,
+      },
+    );
+  }
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`Remote "${name}" has an invalid origin: ${value}`);
+    throw new RemoteServerFunctionError(`Remote "${name}" has an invalid origin: ${value}`, {
+      code: REMOTE_ERROR_CODES.remoteServerFunctionConfig,
+      remote: name,
+      retryable: false,
+    });
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`Remote "${name}" needs an http or https origin: ${value}`);
+    throw new RemoteServerFunctionError(
+      `Remote "${name}" needs an http or https origin: ${value}`,
+      {
+        code: REMOTE_ERROR_CODES.remoteServerFunctionConfig,
+        remote: name,
+        retryable: false,
+      },
+    );
   }
   return url.origin;
 }
@@ -245,9 +354,39 @@ function isSameOrigin(request: Request, origin: string): boolean {
   }
 }
 
-function registry(): Map<string, RemoteServerFunctionsTarget> {
-  const global = globalThis as { [REGISTRY_KEY]?: Map<string, RemoteServerFunctionsTarget> };
+type RegisteredTarget = RemoteServerFunctionsTarget & { onError?: RemoteErrorReporter };
+
+function registry(): Map<string, RegisteredTarget> {
+  const global = globalThis as { [REGISTRY_KEY]?: Map<string, RegisteredTarget> };
   return (global[REGISTRY_KEY] ??= new Map());
+}
+
+function asRemoteServerFunctionError(
+  cause: unknown,
+  remote: string,
+  url?: string,
+): RemoteServerFunctionError {
+  if (cause instanceof RemoteServerFunctionError) return cause;
+  return new RemoteServerFunctionError(`Could not reach remote "${remote}" server function.`, {
+    cause,
+    code: REMOTE_ERROR_CODES.remoteServerFunctionNetwork,
+    remote,
+    retryable: true,
+    url,
+  });
+}
+
+function reportServerFunctionError(
+  reporter: RemoteErrorReporter | undefined,
+  error: RemoteServerFunctionError,
+) {
+  reportRemoteError(reporter, {
+    code: error.code,
+    error,
+    remote: error.remote,
+    retryable: error.retryable,
+    url: error.url,
+  });
 }
 
 function currentStartRequest(): Request | undefined {

@@ -622,6 +622,7 @@ test("runtime subpaths load without a bundler adapter", () => {
     const consumerRequire = createRequire(join(consumer, "consumer.cjs"));
     const runtime = consumerRequire("@module-federation/tanstack/runtime");
     const loader = consumerRequire("@module-federation/tanstack/node-entry-loader");
+    const serverFunctions = consumerRequire("@module-federation/tanstack/server-functions");
     assert.equal(typeof runtime.getRemoteStylesheets, "function");
     assert.equal(typeof runtime.lazyRemote, "function");
     assert.equal(typeof runtime.RemoteFetchError, "function");
@@ -630,6 +631,7 @@ test("runtime subpaths load without a bundler adapter", () => {
     assert.equal(runtime.REMOTE_ERROR_CODES.remoteFetchTimeout, "TANSTACK-REMOTE-FETCH-TIMEOUT");
     assert.equal(typeof loader.default, "function");
     assert.equal(typeof loader.RemoteEntryError, "function");
+    assert.equal(typeof serverFunctions.RemoteServerFunctionError, "function");
   } finally {
     rmSync(consumer, { force: true, recursive: true });
   }

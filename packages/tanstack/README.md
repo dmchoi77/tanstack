@@ -182,6 +182,30 @@ When a remote's server entry cannot load, the host's runtime plugin throws a
 `RemoteEntryError` whose `phase` is `fetch`, `evaluate`, or `loader` and whose
 `cause` is the original error.
 
+The Rsbuild Node entry loader accepts an optional `onError` callback for
+structured observability:
+
+```ts
+tanstackStartModuleFederation({
+  federation: {
+    // ...
+  },
+  server: {
+    ssrEntryLoader: {
+      onError: ({ code, phase, remote, retryable, status, url }) => {
+        reportRemoteFailure({ code, phase, remote, retryable, status, url });
+      },
+    },
+  },
+});
+```
+
+The callback is invoked once for the final `RemoteEntryError`. Its `code`,
+`phase`, `retryable`, URL and HTTP metadata can be used for metrics or retry
+decisions. Callback errors are ignored, there is no default console logging,
+and request bodies, cookies and authorization headers are not included in the
+event. HTTP failures may include the bounded, normalized `bodyPreview`.
+
 Server entries are cached for the lifetime of the Node process by default. To
 pick up a rebuilt remote while keeping the process running, configure the
 revalidation window on an Rsbuild host:
@@ -349,6 +373,14 @@ export const startInstance = createStart(() => ({
 - `timeoutMs` (10 seconds by default) bounds the wait for the remote's response
   headers, not a streamed body. An unreachable or slow remote answers `502` in
   the browser and rejects during server rendering.
+- `createRemoteServerFunctions` accepts an optional `onError` callback. It
+  receives `TANSTACK-SERVER-FUNCTION-NETWORK`,
+  `TANSTACK-SERVER-FUNCTION-TIMEOUT`, or
+  `TANSTACK-SERVER-FUNCTION-CONFIG` events. Browser forwarding still returns
+  the existing `502` response, while server-rendering calls still reject.
+  Callback errors are ignored, and request/response bodies and headers are
+  excluded from the event. Caller-request aborts are propagated without being
+  reported.
 
 The build fails when a remote's exposed modules call server functions and its
 `serverFns.base` is not `/_federation/<name>/_serverFn`.
