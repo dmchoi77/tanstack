@@ -75,7 +75,60 @@ export function lazyRemote<T extends ComponentType<any>>(
 export type RemoteStylesheetOptions = RemoteFetchOptions & {
   /** How long a fetched manifest is reused, in milliseconds. Defaults to 30 seconds. */
   maxAgeMs?: number;
+  /** Resolves a `remote/Expose` specifier to the manifest that declares its assets. */
+  resolveRemote?: RemoteStylesheetResolver;
+  /** Observes failures without converting a rejected stylesheet lookup into a success. */
+  onError?: (error: unknown) => void | Promise<void>;
 };
+
+export type RemoteStylesheetTarget = {
+  manifestUrl: string;
+  expose: string;
+};
+
+export type RemoteStylesheetResolver = (
+  specifier: string,
+) => RemoteStylesheetTarget | Promise<RemoteStylesheetTarget>;
+
+export type RemoteStylesheetRemoteConfig = {
+  entry: string;
+  name?: string;
+  alias?: string;
+  type?: string;
+  internalName?: string;
+  entryGlobalName?: string;
+  shareScope?: string | string[];
+  [key: string]: unknown;
+};
+
+export type RemoteStylesheetRemotes =
+  | Record<string, string | RemoteStylesheetRemoteConfig>
+  | readonly (string | (RemoteStylesheetRemoteConfig & { name: string }))[];
+
+export type RemoteStylesheetRemoteInfo = {
+  entry: string;
+  name: string;
+  alias?: string;
+};
+
+export type RemoteStylesheetResolverOptions = {
+  /**
+   * Converts the configured remote entry into the manifest URL used for CSS metadata.
+   * The default replaces the entry filename with `mf-manifest.json` unless the entry is
+   * already a JSON manifest.
+   */
+  resolveManifestUrl?: (remote: RemoteStylesheetRemoteInfo) => string | Promise<string>;
+};
+
+export class RemoteStylesheetResolutionError extends Error {
+  readonly specifier: string;
+
+  constructor(message: string, specifier: string) {
+    super(message);
+    this.name = "RemoteStylesheetResolutionError";
+    this.specifier = specifier;
+  }
+}
 
 type CssAssets = { async?: string[]; sync?: string[] };
 
@@ -87,6 +140,44 @@ type RemoteManifest = {
 const manifests = new Map<string, ManifestCacheEntry>();
 
 /**
+ * Creates the adapter-owned part of stylesheet lookup. It accepts the object form used by
+ * Vite and the `name@entry` string form used by Rsbuild, but does not inspect a global
+ * federation singleton. The caller can provide the adapter's manifest policy when a direct
+ * entry is not normalized to a sibling manifest by convention.
+ */
+export function createRemoteStylesheetResolver(
+  remotes: RemoteStylesheetRemotes,
+  { resolveManifestUrl = defaultManifestUrl }: RemoteStylesheetResolverOptions = {},
+): RemoteStylesheetResolver {
+  const configured = normalizeRemotes(remotes);
+
+  return async (specifier) => {
+    const { remoteName, expose } = splitRemoteSpecifier(specifier);
+    const remote = configured.find(({ aliases }) => aliases.includes(remoteName));
+    if (!remote) {
+      throw new RemoteStylesheetResolutionError(
+        `No configured remote matches "${remoteName}" in "${specifier}".`,
+        specifier,
+      );
+    }
+
+    const manifestUrl = await resolveManifestUrl(remote.info);
+    if (!manifestUrl) {
+      throw new RemoteStylesheetResolutionError(
+        `Could not resolve a manifest URL for remote "${remote.info.name}".`,
+        specifier,
+      );
+    }
+    return { expose, manifestUrl };
+  };
+}
+
+/** Deduplicates absolute stylesheet URLs while preserving their first declaration order. */
+export function dedupeRemoteStylesheets(...groups: readonly (readonly string[])[]): string[] {
+  return [...new Set(groups.flat())];
+}
+
+/**
  * Lists the stylesheets a remote's manifest declares for an exposed module, as absolute
  * URLs. Return them from a route loader and render them in the route's `head`, so markup
  * a remote rendered on the server is styled before the remote's JavaScript loads.
@@ -96,24 +187,141 @@ const manifests = new Map<string, ManifestCacheEntry>();
 export async function getRemoteStylesheets(
   manifestUrl: string,
   expose: string,
-  { maxAgeMs = 30_000, fetchTimeoutMs, fetchMaxBytes }: RemoteStylesheetOptions = {},
+  options?: RemoteStylesheetOptions,
+): Promise<string[]>;
+export async function getRemoteStylesheets(
+  specifier: string,
+  options?: RemoteStylesheetOptions,
+): Promise<string[]>;
+export async function getRemoteStylesheets(
+  target: string,
+  exposeOrOptions?: string | RemoteStylesheetOptions,
+  explicitOptions?: RemoteStylesheetOptions,
 ): Promise<string[]> {
-  const manifest = await fetchManifest(manifestUrl, {
-    maxAgeMs,
-    fetchTimeoutMs,
-    fetchMaxBytes,
-  });
-  const name = expose.replace(/^\.\//, "");
-  const exposed = manifest.exposes?.find(
-    (candidate) => candidate.path === expose || candidate.name === name,
-  );
-  if (!exposed) throw new Error(`${manifestUrl} does not expose "${expose}".`);
+  const options =
+    typeof exposeOrOptions === "string" ? (explicitOptions ?? {}) : (exposeOrOptions ?? {});
 
-  // "auto" means the assets sit next to the manifest.
-  const publicPath = manifest.metaData?.publicPath;
-  const base = new URL(publicPath && publicPath !== "auto" ? publicPath : ".", manifestUrl);
-  const { async = [], sync = [] } = exposed.assets?.css ?? {};
-  return [...new Set([...sync, ...async])].map((asset) => new URL(asset, base).href);
+  try {
+    const resolved =
+      typeof exposeOrOptions === "string"
+        ? { expose: exposeOrOptions, manifestUrl: target }
+        : await options.resolveRemote?.(target);
+
+    if (!resolved) {
+      throw new RemoteStylesheetResolutionError(
+        `Resolving "${target}" requires the resolveRemote option.`,
+        target,
+      );
+    }
+
+    const manifest = await fetchManifest(resolved.manifestUrl, options);
+    const name = resolved.expose.replace(/^\.\//, "");
+    const exposed = manifest.exposes?.find(
+      (candidate) => candidate.path === resolved.expose || candidate.name === name,
+    );
+    if (!exposed) {
+      throw new Error(`${resolved.manifestUrl} does not expose "${resolved.expose}".`);
+    }
+
+    // "auto" means the assets sit next to the manifest.
+    const publicPath = manifest.metaData?.publicPath;
+    const base = new URL(
+      publicPath && publicPath !== "auto" ? publicPath : ".",
+      resolved.manifestUrl,
+    );
+    const { async = [], sync = [] } = exposed.assets?.css ?? {};
+    return dedupeRemoteStylesheets(sync, async).map((asset) => new URL(asset, base).href);
+  } catch (error) {
+    try {
+      await options.onError?.(error);
+    } catch {
+      // Reporting must never replace the original stylesheet failure.
+    }
+    throw error;
+  }
+}
+
+type NormalizedRemote = {
+  aliases: string[];
+  info: RemoteStylesheetRemoteInfo;
+};
+
+function normalizeRemotes(remotes: RemoteStylesheetRemotes): NormalizedRemote[] {
+  if (Array.isArray(remotes)) {
+    return remotes.map((remote) => normalizeRemote(undefined, remote));
+  }
+  return Object.entries(remotes).map(([key, remote]) => normalizeRemote(key, remote));
+}
+
+function normalizeRemote(
+  key: string | undefined,
+  remote: string | (RemoteStylesheetRemoteConfig & { name?: string }),
+): NormalizedRemote {
+  if (typeof remote === "string") {
+    const named = parseNamedRemote(remote);
+    const entry = named?.entry ?? remote;
+    const name = named?.name ?? key;
+    if (!name) {
+      throw new TypeError(`A remote string must include a name when used in an array: ${remote}`);
+    }
+    return {
+      aliases: uniqueStrings([key, name]),
+      info: { entry, name },
+    };
+  }
+
+  const name = remote.name ?? key;
+  if (!name) throw new TypeError("A configured remote must have a name.");
+  return {
+    aliases: uniqueStrings([key, name, remote.alias]),
+    info: { alias: remote.alias, entry: remote.entry, name },
+  };
+}
+
+function parseNamedRemote(remote: string): { entry: string; name: string } | undefined {
+  const match = /^([^/@]+)@(.+)$/.exec(remote);
+  const name = match?.[1];
+  const entry = match?.[2];
+  if (!name || !entry || (!entry.includes("://") && !entry.startsWith("/"))) return undefined;
+  return { entry, name };
+}
+
+function splitRemoteSpecifier(specifier: string): { expose: string; remoteName: string } {
+  const separator = specifier.indexOf("/");
+  if (separator <= 0 || separator === specifier.length - 1) {
+    throw new RemoteStylesheetResolutionError(
+      `Expected a remote specifier in the form "remote/Expose", received "${specifier}".`,
+      specifier,
+    );
+  }
+  const remoteName = specifier.slice(0, separator);
+  const rawExpose = specifier.slice(separator + 1);
+  return {
+    expose: rawExpose.startsWith(".") ? rawExpose : `./${rawExpose}`,
+    remoteName,
+  };
+}
+
+function defaultManifestUrl(remote: RemoteStylesheetRemoteInfo): string {
+  if (/\.json(?:[?#]|$)/i.test(remote.entry)) return remote.entry;
+
+  try {
+    const url = new URL(remote.entry);
+    url.pathname = url.pathname.replace(/[^/]*$/, "mf-manifest.json");
+    return url.href;
+  } catch {
+    const hashIndex = remote.entry.indexOf("#");
+    const hash = hashIndex >= 0 ? remote.entry.slice(hashIndex) : "";
+    const withoutHash = hashIndex >= 0 ? remote.entry.slice(0, hashIndex) : remote.entry;
+    const queryIndex = withoutHash.indexOf("?");
+    const query = queryIndex >= 0 ? withoutHash.slice(queryIndex) : "";
+    const pathname = queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+    return `${pathname.replace(/[^/]*$/, "mf-manifest.json")}${query}${hash}`;
+  }
+}
+
+function uniqueStrings(values: (string | undefined)[]): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))];
 }
 
 interface ManifestCacheEntry {

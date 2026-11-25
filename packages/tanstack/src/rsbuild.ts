@@ -13,6 +13,10 @@ import {
   SERVER_FN_BASE_DEFINE,
 } from "./server-container";
 import { defaultShared, eagerShared, resolveShared, tanstackStartSharedPackages } from "./shared";
+import {
+  createRemoteStylesheetResolverModule,
+  REMOTE_STYLESHEET_RESOLVER_MODULE,
+} from "./remote-stylesheet-adapter";
 
 type ModuleFederationOverride = Partial<ModuleFederationOptions>;
 
@@ -88,6 +92,7 @@ export function tanstackStartModuleFederation({
       environment: clientEnvironment,
       target: "web",
     }),
+    remoteStylesheetResolverPlugin(federation.remotes),
     ...(isHost ? [remoteRetryPlugin()] : []),
     clientCompatibilityPlugin({
       chunkLoadingGlobal: chunkLoadingGlobal ?? `chunk_${federationName}`,
@@ -162,6 +167,32 @@ export function tanstackStartModuleFederation({
   }
 
   return plugins;
+}
+
+function remoteStylesheetResolverPlugin(
+  remotes: ModuleFederationOptions["remotes"],
+): RsbuildPlugin {
+  const moduleCode = createRemoteStylesheetResolverModule(remotes);
+
+  return {
+    name: "tanstack-start-federation-remote-stylesheet-resolver",
+    setup(api) {
+      api.modifyBundlerChain((chain, { rspack }) => {
+        chain.plugin("tanstack-start-remote-stylesheet-resolver").use(
+          new rspack.NormalModuleReplacementPlugin(
+            new RegExp(`^${escapeRegExp(REMOTE_STYLESHEET_RESOLVER_MODULE)}$`),
+            (resource) => {
+              resource.request = `data:text/javascript,${encodeURIComponent(moduleCode)}`;
+            },
+          ),
+        );
+      });
+    },
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export const pluginTanStackStartModuleFederation = tanstackStartModuleFederation;
