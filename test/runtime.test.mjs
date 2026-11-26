@@ -663,6 +663,50 @@ test("resolves stylesheet manifests from Vite and Rsbuild remote identities", as
     [`${origin}/resolver/rsbuild/assets/card.css`],
   );
 
+  const externalResolver = createRemoteStylesheetResolver({
+    external_remote: { external: `${origin}/resolver/rsbuild/mf-manifest.json` },
+  });
+  assert.deepEqual(
+    await getRemoteStylesheets("external_remote/Card", { resolveRemote: externalResolver }),
+    [`${origin}/resolver/rsbuild/assets/card.css`],
+  );
+
+  const arrayResolver = createRemoteStylesheetResolver([
+    { array_remote: `array_remote@${origin}/resolver/rsbuild/mf-manifest.json` },
+  ]);
+  assert.deepEqual(
+    await getRemoteStylesheets("array_remote/Card", { resolveRemote: arrayResolver }),
+    [`${origin}/resolver/rsbuild/assets/card.css`],
+  );
+
+  const aliasResolver = createRemoteStylesheetResolver({
+    keyed_remote: {
+      alias: "catalog",
+      entry: `${origin}/resolver/vite/mf-manifest.json`,
+      name: "vite_remote",
+    },
+  });
+  assert.deepEqual(
+    await getRemoteStylesheets("catalog/StatusCard", { resolveRemote: aliasResolver }),
+    [`${origin}/resolver/vite/assets/card.css`],
+  );
+
+  const customManifestResolver = createRemoteStylesheetResolver(
+    {
+      custom_remote: {
+        entry: `${origin}/resolver/custom/remoteEntry.js`,
+        name: "custom_remote",
+      },
+    },
+    { resolveManifestUrl: () => `${origin}/resolver/vite/mf-manifest.json` },
+  );
+  assert.deepEqual(
+    await getRemoteStylesheets("custom_remote/StatusCard", {
+      resolveRemote: customManifestResolver,
+    }),
+    [`${origin}/resolver/vite/assets/card.css`],
+  );
+
   const signedEntryResolver = createRemoteStylesheetResolver({
     signed_remote: {
       entry: `${origin}/resolver/signed/remoteEntry.js?token=abc#fragment`,

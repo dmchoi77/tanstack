@@ -91,9 +91,10 @@ export type RemoteStylesheetResolver = (
 ) => RemoteStylesheetTarget | Promise<RemoteStylesheetTarget>;
 
 export type RemoteStylesheetRemoteConfig = {
-  entry: string;
+  entry?: string;
   name?: string;
   alias?: string;
+  external?: string | readonly string[];
   type?: string;
   internalName?: string;
   entryGlobalName?: string;
@@ -101,9 +102,15 @@ export type RemoteStylesheetRemoteConfig = {
   [key: string]: unknown;
 };
 
+type RemoteStylesheetRemoteValue = string | readonly string[] | RemoteStylesheetRemoteConfig;
+
 export type RemoteStylesheetRemotes =
-  | Record<string, string | RemoteStylesheetRemoteConfig>
-  | readonly (string | (RemoteStylesheetRemoteConfig & { name: string }))[];
+  | Record<string, RemoteStylesheetRemoteValue>
+  | readonly (
+      | string
+      | RemoteStylesheetRemoteConfig
+      | Record<string, RemoteStylesheetRemoteValue>
+    )[];
 
 export type RemoteStylesheetRemoteInfo = {
   entry: string;
@@ -138,6 +145,7 @@ type RemoteManifest = {
 };
 
 const manifests = new Map<string, ManifestCacheEntry>();
+let adapterResolver: Promise<RemoteStylesheetResolver> | undefined;
 
 /**
  * Creates the adapter-owned part of stylesheet lookup. It accepts the object form used by
@@ -146,7 +154,7 @@ const manifests = new Map<string, ManifestCacheEntry>();
  * entry is not normalized to a sibling manifest by convention.
  */
 export function createRemoteStylesheetResolver(
-  remotes: RemoteStylesheetRemotes,
+  remotes: RemoteStylesheetRemotes = {},
   { resolveManifestUrl = defaultManifestUrl }: RemoteStylesheetResolverOptions = {},
 ): RemoteStylesheetResolver {
   const configured = normalizeRemotes(remotes);
@@ -182,6 +190,9 @@ export function dedupeRemoteStylesheets(...groups: readonly (readonly string[])[
  * URLs. Return them from a route loader and render them in the route's `head`, so markup
  * a remote rendered on the server is styled before the remote's JavaScript loads.
  *
+ * The `remote/Expose` form uses the active Vite or Rsbuild adapter resolver automatically.
+ * Pass `resolveRemote` to override it, or use the explicit `(manifestUrl, expose)` form.
+ *
  * Rejects when the manifest cannot be fetched or does not list `expose`.
  */
 export async function getRemoteStylesheets(
@@ -205,7 +216,7 @@ export async function getRemoteStylesheets(
     const resolved =
       typeof exposeOrOptions === "string"
         ? { expose: exposeOrOptions, manifestUrl: target }
-        : await options.resolveRemote?.(target);
+        : await (options.resolveRemote ?? (await loadAdapterResolver()))(target);
 
     if (!resolved) {
       throw new RemoteStylesheetResolutionError(
@@ -233,7 +244,8 @@ export async function getRemoteStylesheets(
     return dedupeRemoteStylesheets(sync, async).map((asset) => new URL(asset, base).href);
   } catch (error) {
     try {
-      await options.onError?.(error);
+      const report = options.onError?.(error);
+      if (report) void Promise.resolve(report).catch(() => undefined);
     } catch {
       // Reporting must never replace the original stylesheet failure.
     }
@@ -248,14 +260,21 @@ type NormalizedRemote = {
 
 function normalizeRemotes(remotes: RemoteStylesheetRemotes): NormalizedRemote[] {
   if (Array.isArray(remotes)) {
-    return remotes.map((remote) => normalizeRemote(undefined, remote));
+    return remotes.flatMap((remote) => {
+      if (typeof remote === "string" || isRemoteConfig(remote)) {
+        return [normalizeRemote(undefined, remote)];
+      }
+      return Object.entries(remote as Record<string, RemoteStylesheetRemoteValue>).map(
+        ([key, value]) => normalizeRemote(key, value),
+      );
+    });
   }
   return Object.entries(remotes).map(([key, remote]) => normalizeRemote(key, remote));
 }
 
 function normalizeRemote(
   key: string | undefined,
-  remote: string | (RemoteStylesheetRemoteConfig & { name?: string }),
+  remote: RemoteStylesheetRemoteValue,
 ): NormalizedRemote {
   if (typeof remote === "string") {
     const named = parseNamedRemote(remote);
@@ -270,12 +289,54 @@ function normalizeRemote(
     };
   }
 
-  const name = remote.name ?? key;
+  if (isRemoteEntryList(remote)) {
+    const first = remote[0];
+    if (!first) {
+      throw new TypeError(`Remote "${key ?? "unknown"}" must define an entry.`);
+    }
+    return normalizeRemote(key, first);
+  }
+
+  const external = firstString(remote.external);
+  const source = remote.entry ?? external;
+  const parsed = source ? parseNamedRemote(source) : undefined;
+  const name = remote.name ?? parsed?.name ?? key;
   if (!name) throw new TypeError("A configured remote must have a name.");
+  const entry = parsed?.entry ?? source;
+  if (!entry) {
+    throw new TypeError(`Remote "${name}" must define an entry or external URL.`);
+  }
   return {
-    aliases: uniqueStrings([key, name, remote.alias]),
-    info: { alias: remote.alias, entry: remote.entry, name },
+    aliases: uniqueStrings([key, name, parsed?.name, remote.alias]),
+    info: { alias: remote.alias ?? (key !== name ? key : undefined), entry, name },
   };
+}
+
+function isRemoteConfig(value: unknown): value is RemoteStylesheetRemoteConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const remote = value as Record<string, unknown>;
+  return (
+    typeof remote.entry === "string" ||
+    typeof remote.external === "string" ||
+    Array.isArray(remote.external) ||
+    typeof remote.name === "string" ||
+    typeof remote.alias === "string"
+  );
+}
+
+function isRemoteEntryList(value: unknown): value is readonly string[] {
+  return Array.isArray(value);
+}
+
+function firstString(value: string | readonly string[] | undefined): string | undefined {
+  return typeof value === "string" ? value : value?.find((item): item is string => Boolean(item));
+}
+
+async function loadAdapterResolver(): Promise<RemoteStylesheetResolver> {
+  adapterResolver ??= import("@module-federation/tanstack/remote-stylesheet-resolver").then(
+    ({ resolveRemoteStylesheet }) => resolveRemoteStylesheet,
+  );
+  return adapterResolver;
 }
 
 function parseNamedRemote(remote: string): { entry: string; name: string } | undefined {

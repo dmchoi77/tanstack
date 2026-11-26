@@ -3,7 +3,6 @@ import {
   getRemoteStylesheets,
   lazyRemote,
 } from "@module-federation/tanstack/runtime";
-import { resolveRemoteStylesheet } from "@module-federation/tanstack/remote-stylesheet-resolver";
 import { createFileRoute } from "@tanstack/react-router";
 import { RemoteBoundary } from "../components/RemoteBoundary";
 import { ServerAnswers } from "../components/ServerAnswers";
@@ -34,9 +33,10 @@ export const Route = createFileRoute("/")({
       Promise.all(
         ["tanstack_rsbuild_ssr_remote/StatusCard", "tanstack_vite_remote/StatusCard"].map(
           (specifier) =>
-            getRemoteStylesheets(specifier, { resolveRemote: resolveRemoteStylesheet }).catch(
-              () => [],
-            ),
+            getRemoteStylesheets(specifier, {
+              onError: (error) =>
+                console.error(`Failed to resolve stylesheets for ${specifier}`, error),
+            }).catch(() => []),
         ),
       ).then((lists) => dedupeRemoteStylesheets(...lists)),
       askRemoteServer(),
